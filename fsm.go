@@ -25,8 +25,12 @@
 package fsm
 
 import (
+	"log"
+	"os"
 	"strings"
 )
+
+var logger *log.Logger
 
 // FSM is the state machine that holds the current state.
 //
@@ -36,7 +40,7 @@ type FSM struct {
 	current string
 
 	// transitions maps events and source states to destination states.
-	transitions map[eKey]string
+	transitions map[eKey]*eValue
 
 	// callbacks maps events and targers to callback functions.
 	callbacks map[cKey]Callback
@@ -61,12 +65,12 @@ type EventDesc struct {
 
 	// Dst is the destination state that the FSM will be in if the transition
 	// succeds.
-	Dst string
+	Dst []string
 }
 
 // Callback is a function type that callbacks should use. Event is the current
 // event info as the callback happens.
-type Callback func(*Event)
+type Callback func(*Event) string
 
 // Events is a shorthand for defining the transition map in NewFSM.
 type Events []EventDesc
@@ -111,9 +115,10 @@ type Callbacks map[string]Callback
 // to the psuedo random nature of Go maps. No checking for multiple keys is
 // currently performed.
 func NewFSM(initial string, events []EventDesc, callbacks map[string]Callback) *FSM {
+	logger = log.New(os.Stderr, "", log.Ldate|log.Lmicroseconds|log.Lshortfile)
 	var f FSM
 	f.current = initial
-	f.transitions = make(map[eKey]string)
+	f.transitions = make(map[eKey]*eValue)
 	f.callbacks = make(map[cKey]Callback)
 
 	// Build transition map and store sets of all events and states.
@@ -121,9 +126,13 @@ func NewFSM(initial string, events []EventDesc, callbacks map[string]Callback) *
 	allStates := make(map[string]bool)
 	for _, e := range events {
 		for _, src := range e.Src {
-			f.transitions[eKey{e.Name, src}] = e.Dst
-			allStates[src] = true
-			allStates[e.Dst] = true
+			f.transitions[eKey{e.Name, src}] = &eValue{DefaultDst: "foo", Dst: make(map[string]bool)}
+			f.transitions[eKey{e.Name, src}].DefaultDst = e.Dst[0]
+			for _, dst := range e.Dst {
+				f.transitions[eKey{e.Name, src}].Dst[dst] = true
+				allStates[src] = true
+				allStates[dst] = true
+			}
 		}
 		allEvents[e.Name] = true
 	}
@@ -194,15 +203,15 @@ func (f *FSM) Is(state string) bool {
 }
 
 // Can returns true if event can occur in the current state.
-func (f *FSM) Can(event string) bool {
-	_, ok := f.transitions[eKey{event, f.current}]
+func (f *FSM) Can(event string, dst string) bool {
+	_, ok := f.transitions[eKey{event, f.current}].Dst[dst]
 	return ok && (f.transition == nil)
 }
 
 // Cannot returns true if event can not occure in the current state.
 // It is a convenience method to help code read nicely.
-func (f *FSM) Cannot(event string) bool {
-	return !f.Can(event)
+func (f *FSM) Cannot(event string, dst string) bool {
+	return !f.Can(event, dst)
 }
 
 // Event initiates a state transition with the named event.
@@ -227,7 +236,7 @@ func (f *FSM) Event(event string, args ...interface{}) error {
 		return &InTransitionError{event}
 	}
 
-	dst, ok := f.transitions[eKey{event, f.current}]
+	dstStruct, ok := f.transitions[eKey{event, f.current}]
 	if !ok {
 		for ekey := range f.transitions {
 			if ekey.event == event {
@@ -237,22 +246,22 @@ func (f *FSM) Event(event string, args ...interface{}) error {
 		return &UnknownEventError{event}
 	}
 
+	dst := dstStruct.DefaultDst
+
 	e := &Event{f, event, f.current, dst, nil, args, false, false}
 
-	err := f.beforeEventCallbacks(e)
+	dst, err := f.beforeEventCallbacks(e)
 	if err != nil {
 		return err
 	}
 
 	if f.current == dst {
 		f.afterEventCallbacks(e)
-		return &NoTransitionError{e.Err}
 	}
-
+	previous := f.current
 	// Setup the transition, call it later.
 	f.transition = func() {
 		f.current = dst
-		f.enterStateCallbacks(e)
 		f.afterEventCallbacks(e)
 	}
 
@@ -263,6 +272,10 @@ func (f *FSM) Event(event string, args ...interface{}) error {
 
 	// Perform the rest of the transition, if not asynchronous.
 	err = f.Transition()
+	f.enterStateCallbacks(e)
+	if previous != dst {
+		logger.Println("State transition to", f.current)
+	}
 	if err != nil {
 		return &InternalError{}
 	}
@@ -285,20 +298,20 @@ func (f *FSM) Transition() error {
 
 // beforeEventCallbacks calls the before_ callbacks, first the named then the
 // general version.
-func (f *FSM) beforeEventCallbacks(e *Event) error {
+func (f *FSM) beforeEventCallbacks(e *Event) (string, error) {
 	if fn, ok := f.callbacks[cKey{e.Event, callbackBeforeEvent}]; ok {
-		fn(e)
+		return fn(e), nil
 		if e.canceled {
-			return &CanceledError{e.Err}
+			return "", &CanceledError{e.Err}
 		}
 	}
 	if fn, ok := f.callbacks[cKey{"", callbackBeforeEvent}]; ok {
-		fn(e)
+		return fn(e), nil
 		if e.canceled {
-			return &CanceledError{e.Err}
+			return "", &CanceledError{e.Err}
 		}
 	}
-	return nil
+	return "", nil
 }
 
 // leaveStateCallbacks calls the leave_ callbacks, first the named then the
@@ -354,6 +367,11 @@ const (
 	callbackEnterState
 	callbackAfterEvent
 )
+
+type eValue struct {
+	Dst        map[string]bool
+	DefaultDst string
+}
 
 // cKey is a struct key used for keeping the callbacks mapped to a target.
 type cKey struct {
